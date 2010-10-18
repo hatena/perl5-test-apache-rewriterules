@@ -4,7 +4,7 @@ use warnings;
 our $VERSION = '1.0';
 use File::Temp qw(tempfile tempdir);
 use Path::Class;
-use Net::TCP::FindPort;
+use Test::TCP qw(empty_port);
 use LWP::UserAgent;
 use HTTP::Request;
 use Test::Differences;
@@ -36,14 +36,9 @@ sub add_backend {
     push @{$self->{backends}}, \%args;
 }
 
-sub get_next_port {
-    my $self = shift;
-    return Net::TCP::FindPort->find_listenable_port;
-}
-
 sub proxy_port {
     my $self = shift;
-    return $self->{proxy_port} ||= $self->get_next_port;
+    return $self->{proxy_port} ||= empty_port();
 }
 
 sub proxy_host {
@@ -61,7 +56,7 @@ sub proxy_http_url {
 sub backend_port {
     my ($self, $backend_name) = @_;
     for (@{$self->{backends}}) {
-        return $_->{port} ||= $self->get_next_port
+        return $_->{port} ||= empty_port()
             if $_->{name} eq $backend_name;
     }
     die "Can't find backend |$backend_name|";
