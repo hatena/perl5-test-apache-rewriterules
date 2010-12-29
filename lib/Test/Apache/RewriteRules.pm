@@ -1,290 +1,285 @@
 package Test::Apache::RewriteRules;
+use 5.008001;
 use strict;
 use warnings;
-our $VERSION = '1.0';
-use File::Temp qw(tempfile tempdir);
-use Path::Class;
-use Test::TCP qw(empty_port);
+use Carp qw(croak);
+
+use JSON::XS qw(decode_json);
+use Path::Class qw(dir file);
+use File::Temp qw(tempfile);
+
 use LWP::UserAgent;
 use HTTP::Request;
+
 use Test::Differences;
-use Time::HiRes qw(usleep);
+use Test::Httpd::Apache2;
+use Test::TCP qw(empty_port);
 
-my $data_d = file(__FILE__)->dir->subdir('RewriteRules')->absolute->cleanup;
-{
-    my $dn = $data_d->stringify;
-    1 while $dn =~ s[(^|/)(?!\.\./)[^/]+/\.\.(?=$|/)][$1]g;
-    $data_d = dir($dn);
-}
-my $modules_f = $data_d->file('modules.conf');
-my $backend_d = $data_d;
-our $HttpdPath = '/usr/sbin/httpd';
-
-sub available {
-    return -x $HttpdPath;
-}
+our $VERSION = '1.0';
 
 sub new {
-    my $class = shift;
-    return bless {
-        backends => [],
-    }, $class;
+    my ($class, %args) = @_;
+    bless { backends => [], %args }, $class;
+}
+
+sub available {
+    my ($class, %apache_options) = @_;
+    my $apache = Test::Httpd::Apache2->new(
+        %apache_options,
+        auto_start => 0,
+    );
+    eval { $apache->start };
+    my $is_available = !$@;
+    eval { undef $apache  };
+    $is_available;
 }
 
 sub add_backend {
-    my ($self, %args) = @_;
-    push @{$self->{backends}}, \%args;
+    my ($self, %backend) = @_;
+    $backend{port}   ||= empty_port();
+    $backend{apache} ||= $self->create_backend_apache(%backend);
+    push @{$self->{backends}}, \%backend;
 }
 
 sub proxy_port {
     my $self = shift;
-    return $self->{proxy_port} ||= empty_port();
+    $self->{proxy_port} ||= empty_port();
 }
 
 sub proxy_host {
     my $self = shift;
-    return 'localhost:' . $self->proxy_port;
+    sprintf q<localhost:%s>, $self->proxy_port;
 }
 
 sub proxy_http_url {
     my $self = shift;
     my $path = shift || q</>;
-    $path =~ s[^//[^/]*/][/];
-    return q<http://> . $self->proxy_host . $path;
+       $path =~ s[^//[^/]*/][/];
+
+    sprintf q<http://%s%s>, $self->proxy_host, $path;
 }
 
 sub backend_port {
     my ($self, $backend_name) = @_;
-    for (@{$self->{backends}}) {
-        return $_->{port} ||= empty_port()
-            if $_->{name} eq $backend_name;
+
+    for my $backend (@{$self->{backends}}) {
+        return $backend->{port}
+            if $backend->{name} eq $backend_name;
     }
-    die "Can't find backend |$backend_name|";
+
+    croak qq<Can't find backend by name: $backend_name>;
 }
 
 sub backend_host {
     my ($self, $backend_name) = @_;
-    return 'localhost:' . $self->backend_port($backend_name);
+    sprintf q<localhost:%s>, $self->backend_port($backend_name);
 }
 
 sub get_backend_name_by_port {
     my ($self, $port) = @_;
-    for (@{$self->{backends}}) {
-        if ($_->{port} and $_->{port} == $port) {
-            return $_->{name};
-        }
+
+    for my $backend (@{$self->{backends}}) {
+        return $backend->{name}
+            if ($backend->{port} || 0) == $port
     }
-    return undef;
 }
 
-sub rewrite_conf_f {
-    my $self = shift;
-    if (@_) {
-        $self->{rewrite_conf_f} = shift->absolute;
-        return unless defined wantarray;
-    }
-    return $self->{rewrite_conf_f};
+sub rewrite_conf {
+    my ($self, $rewrite_conf) = @_;
+    $self->{rewrite_conf} ||= $rewrite_conf && file($rewrite_conf);
 }
 
-sub copy_conf_as_f {
-    my ($self, $orig_f, $patterns) = @_;
+*rewrite_conf_f = \&rewrite_conf;
+
+sub copy_config {
+    my ($self, $original_conf, $patterns) = @_;
     $patterns ||= [];
-    my $conf = $orig_f->slurp;
+    $original_conf = file($original_conf);
+    my $config     = eval { $original_conf->slurp };
+
+    croak $@ if $@;
+
     while (@$patterns) {
-        my $regexp = shift @$patterns;
-        $regexp = ref $regexp eq 'Regexp' ? $regexp : qr/\Q$regexp\E/;
-        my $new = shift @$patterns;
-        my $v = ref $new eq 'CODE' ? $new : sub { $new };
-        $conf =~ s/$regexp/$v->()/ge;
+        my $pattern = shift @$patterns;
+           $pattern = ref $pattern eq 'Regexp' ? $pattern : qr/\Q$pattern\E/;
+        my $replace = shift @$patterns;
+        my $code    = ref $replace eq 'CODE' ? $replace : sub { $replace };
+
+        $config =~ s/$pattern/$code->()/ge;
     }
-    
-    my $new_name = $orig_f->basename;
-    $new_name =~ s/\.[^.]*//g;
-    $new_name .= 'XXXXX';
-    (undef, $new_name) = tempfile($new_name, DIR => $self->server_root_dir_name, SUFFIX => '.conf');
 
-    my $new_f = file($new_name);
-    my $new_file = $new_f->openw;
-    print $new_file $conf;
-    close $new_file;
-    
-    return $new_f;
+    my $copied_conf = $original_conf->basename;
+       $copied_conf =~ s/\.[^.]*//g;
+       $copied_conf .= 'XXXXX';
+
+    (undef, $copied_conf) = tempfile(
+        $copied_conf,
+        DIR => $self->server_root,
+    );
+    $copied_conf = file($copied_conf);
+
+    my $fh = $copied_conf->openw;
+    print $fh $config;
+    close $fh;
+
+    $copied_conf;
 }
 
-sub server_root_dir_name {
+*copy_conf_as_f = \&copy_config;
+
+sub server_root {
     my $self = shift;
-    return $self->{server_root_dir_name} ||= tempdir;
+    dir($self->apache->server_root);
 }
 
-sub server_root_d {
-    my $self = shift;
-    return $self->{server_root_d} ||= dir($self->server_root_dir_name);
-}
+*server_root_d = \&server_root;
 
 sub proxy_document_root_d {
-    return $backend_d->absolute->cleanup;
+    my $self = shift;
+    $self->server_root->absolute->cleanup;
 }
 
-sub prepare_server_dirs {
-    my $self = shift;
-    $self->server_root_d->subdir('logs')->mkpath;
+sub receiver {
+    my $self   = shift;
+    return $self->{receiver} if $self->{receiver};
+
+    my $receiver_path_name = 'url.cgi';
+    my $receiver = <<"EOS";
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use JSON::XS;
+
+print "Content-Type: application/json;\\n\\n";
+print encode_json({
+    host            => \$ENV{HTTP_HOST},
+    path            => \$ENV{REQUEST_URI},
+    path_translated => \$ENV{PATH_TRANSLATED} . (\$ENV{REQUEST_URI} =~ /\\?/ ? "?\$ENV{QUERY_STRING}" : '')
+});
+EOS
+
+    my $receiver_file = sprintf '%s/%s', $self->server_root, $receiver_path_name;
+    open my $fh, "> $receiver_file" or die $!;
+    print $fh $receiver;
+    close $fh;
+    chmod 0755, $receiver_file
+        or die "Couldn't chmod receiver file: $receiver_file";
+
+    $self->{receiver} = file($receiver_file);
 }
 
-sub pid_f {
+sub custom_conf {
     my $self = shift;
-    return $self->{pid_f} ||= $self->server_root_d->file('apache.pid');
-}
 
-sub conf_f {
-    my $self = shift;
-    return $self->{conf_f} ||= $self->server_root_d->file('apache.conf');
-}
+    croak "rewrite conf is required"
+        if !$self->rewrite_conf;
 
-sub conf_file_name {
-    my $self = shift;
-    return $self->conf_f->stringify;
-}
-
-sub generate_conf {
-    my $self = shift;
-    
-    my $server_root_dir_name = $self->server_root_dir_name;
-    $self->prepare_server_dirs;
-
-    my $pid_f = $self->pid_f;
-    my $proxy_document_root_d = $self->proxy_document_root_d;
-    my $backend_d = $backend_d;
-    my $rewrite_conf_f = $self->rewrite_conf_f or die;
-
-    my $proxy_port = $self->proxy_port;
-
-    my $backend_setenvs = '';
-    my $backend_vhosts = '';
+    my $custom_conf  = '';
     for my $backend (@{$self->{backends}}) {
-        my $port = $self->backend_port($backend->{name});
-        $backend_setenvs .= 'SetEnvIf Request_URI .* ' . $backend->{name} . '=localhost:' . $port . "\n";
-        $backend_vhosts .= qq[
-Listen $port
-<VirtualHost *:$port>
-  ServerName $backend->{name}.test:$port
-  DocumentRoot $backend_d/
-  AddHandler cgi-script .cgi
-  <Location $backend_d/>
-    Options +ExecCGI
-  </Location>
-  RewriteEngine on
-  RewriteRule /(.*) /url.cgi/\$1 [L]
-</VirtualHost>
-];
+        $custom_conf .= sprintf "SetEnvIf Request_URI .* %s=localhost:%s\n",
+            $backend->{name}, $backend->{port};
     }
 
-    my $conf_file_name = $self->conf_f->stringify;
-    open my $conf_f, '>', $conf_file_name or die "$0: $conf_file_name: $!";
-    
-    print $conf_f qq[
-LogLevel debug
+    $custom_conf .= <<"EOS";
+ServerName   proxy.test:@{[$self->proxy_port]}
+DocumentRoot @{[$self->server_root]}
 
-Include "$modules_f"
+RewriteRule ^/url\\.cgi/ - [L]
 
-ServerRoot $server_root_dir_name
-PidFile $pid_f
-CustomLog logs/access_log "%v\t%h %l %u %t %r %>s %b"
-TypesConfig /etc/mime.types
+Include "@{[$self->rewrite_conf]}"
 
-Listen $proxy_port
-<VirtualHost *:$proxy_port>
-  ServerName proxy.test:$proxy_port
-  DocumentRoot $proxy_document_root_d/
-  $backend_setenvs
+Action default-proxy-handler /@{[$self->receiver->basename]} virtual
+SetHandler default-proxy-handler
 
-  RewriteRule ^/url\\.cgi/ - [L]
-
-  Include "$rewrite_conf_f"
-
-  Action default-proxy-handler /url.cgi virtual
-  SetHandler default-proxy-handler
-
-  <Location /url.cgi>
-    SetHandler cgi-script
-  </Location>
-</VirtualHost>
-
-$backend_vhosts
-];
-
-    close $conf_f;
-    $self->{conf_generated} = 1;
+<Location /@{[$self->receiver->basename]}>
+  SetHandler cgi-script
+</Location>
+EOS
 }
 
-sub conf_generated {
+my @required_modules = qw(
+    log_config
+    setenvif
+    alias
+    rewrite
+    authn_file
+    authz_host
+    auth_basic
+    mime
+    proxy
+    proxy_http
+    cgi
+    actions
+);
+
+sub apache {
     my $self = shift;
-    return $self->{conf_generated};
+    return $self->{apache} if $self->{apache};
+
+    my $apache_options = $self->{apache_options} || {};
+    $self->{apache} = Test::Httpd::Apache2->new(
+        auto_start       => 0,
+        listen           => $self->proxy_port,
+        required_modules => \@required_modules,
+        %$apache_options,
+    );
+    $self->{apache}->server_root($self->{apache}->tmpdir);
+    $self->{apache}
 }
 
 sub start_apache {
     my $self = shift;
-    $self->generate_conf unless $self->conf_generated;
-    my $conf = $self->conf_file_name or die;
-    system $HttpdPath, -f => $conf, -k => 'start';
-    if ($? == -1) {
-        die "$0: $HttpdPath: $!";
-    } elsif ($? & 127) {
-        die "$0: $HttpdPath: " . ($? & 127);
-    }
-    $self->wait_for_starting_apache;
-}
+       $self->apache->custom_conf($self->custom_conf);
+       $self->apache->start;
 
-sub wait_for_starting_apache {
-    my $self = shift;
-    my $pid_f = $self->pid_f;
-    warn sprintf "Waiting for startng apache process (%s)...\n",
-        $self->server_root_dir_name;
-    my $i = 0;
-    while (not -f $pid_f) {
-        usleep 10_000;
-        if ($i++ >= 100_00) {
-            die "$0: $HttpdPath: Apache does not start in 100 seconds";
-        }
+    for my $backend (@{$self->{backends}}) {
+        $backend->{apache}->start;
     }
 }
 
 sub stop_apache {
     my $self = shift;
-    my $conf = $self->conf_file_name or die;
-    system $HttpdPath, -f => $conf, -k => 'stop';
-    $self->wait_for_stopping_apache;
-}
+       $self->apache->stop if $self->apache->pid;
 
-sub wait_for_stopping_apache {
-    my $self = shift;
-    my $pid_f = $self->pid_f;
-    warn sprintf "Waiting for stopping apache process (%s)...\n",
-        $self->server_root_dir_name;
-    my $i = 0;
-    while (-f $pid_f) {
-        usleep 10_000;
-        if ($i++ >= 100_00) {
-            die "$0: $HttpdPath: Apache does not end in 100 seconds";
-        }
+    for my $backend (@{$self->{backends}}) {
+        $backend->{apache}->stop if $backend->{apache}->pid;
     }
 }
 
-sub DESTROY {
-    my $self = shift;
-    if (-f $self->pid_f) {
-        $self->stop_apache;
-    }
-}
+sub create_backend_apache {
+    my ($self, %backend) = @_;
+    my $apache_options = $self->{apache_options} || {};
+    my $proxy_apache   = $self->apache;
+    my $backend_apache = Test::Httpd::Apache2->new(
+        auto_start       => 0,
+        listen           => $backend{port},
+        required_modules => \@required_modules,
+        %$apache_options,
+    );
+    $backend_apache->server_root($proxy_apache->server_root);
+    $backend_apache->custom_conf(<<"EOS");
+ServerName   @{[$backend{name}]}.test:@{[$backend{port}]}
+DocumentRoot @{[$backend_apache->server_root]}
 
+AddHandler cgi-script .cgi
+<Location @{[$backend_apache->server_root]}>
+  Options +ExecCGI
+</Location>
+
+RewriteEngine on
+RewriteRule /(.*) /@{[$self->receiver->basename]}/\$1 [L]
+EOS
+    $backend_apache;
+}
 
 sub get_rewrite_result {
     my ($self, %args) = @_;
 
-    my $url = $self->proxy_http_url($args{orig_path});
+    my $url    = $self->proxy_http_url($args{orig_path});
     my $method = $Test::Apache::RewriteRules::ClientEnvs::RequestMethod || 'GET';
 
     my $req = HTTP::Request->new($method => $url);
-    my $ua = LWP::UserAgent->new(max_redirect => 0, agent => '');
+    my $ua  = LWP::UserAgent->new(max_redirect => 0, agent => '');
 
     my $UA = $Test::Apache::RewriteRules::ClientEnvs::UserAgent;
     if (defined $UA) {
@@ -320,39 +315,297 @@ sub get_rewrite_result {
     }
 
     my $res = $ua->request($req);
+    die $res->status_line if $res->is_error;
 
     my $code = $res->code;
+    my $result;
 
-    my $result = $code >= 300 ? '' : join "\n", (split /\n/, $res->content)[0, $args{use_path_translated} ? 2 : 1];
-    $result =~ s/^(localhost:(\d+))/$1 . q[ (].($self->get_backend_name_by_port($2) || '').q[)]/e;
-    $result = $code . ' ' . ($res->header('Location') || '') . "\n" . $result;
-    return $result;
+    if ($code >= 300) {
+        $result = {
+            code => $code,
+        };
+        $result->{location} = $res->header('Location') if $res->header('Location');
+    }
+    else {
+        $result = eval { decode_json($res->content) };
+        die $@ if $@;
+        $result->{code} = $code;
+        $result->{host} =~ s!
+            ^(localhost:(\d+))!
+            qq[$1 (@{[($self->get_backend_name_by_port($2) || '')]})]
+        !xe;
+
+        my $path_translated = delete $result->{path_translated};
+        if ($args{use_path_translated}) {
+            $result->{path} = $path_translated;
+        }
+    }
+
+    $result;
 }
 
 sub is_host_path {
     local $Test::Builder::Level = $Test::Builder::Level + 1;
-    
-    my ($self, $orig_path, $backend_name, $path, $name) = @_;
 
-    my $result = $self->get_rewrite_result(orig_path => $orig_path, use_path_translated => ($backend_name eq ''));
+    my ($self, $orig_path, $backend_name, $path, $name) = @_;
+    $backend_name = defined $backend_name ? $backend_name : '';
+
+    my $use_path_translated = !$backend_name;
+    my $result = $self->get_rewrite_result(
+        orig_path           => $orig_path,
+        use_path_translated => $use_path_translated,
+    );
 
     my $host = $backend_name
         ? $self->backend_host($backend_name)
         : $self->proxy_host;
     $host .= " ($backend_name)";
 
-    eq_or_diff $result, "200 \n" . $host . "\n" . $path, $name;
+    my $expected = {
+        code => 200,
+        host => $host,
+        path => $path,
+    };
+
+    eq_or_diff $result, $expected, $name;
 }
 
 sub is_redirect {
     local $Test::Builder::Level = $Test::Builder::Level + 1;
-    
+
     my ($self, $orig_path, $redirect_url, $name, %args) = @_;
-
     my $result = $self->get_rewrite_result(orig_path => $orig_path);
-
     my $code = $args{code} || 302;
-    eq_or_diff $result, "$code $redirect_url\n", $name;
+
+    my $expected = {
+        code => $code,
+    };
+    $expected->{location} = $redirect_url if $redirect_url;
+
+    eq_or_diff $result, $expected, $name;
+}
+
+sub DESTROY {
+    my $self = shift;
+       $self->stop_apache;
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Test::Apache::RewriteRules - Testing Apache's Rewrite Rules
+
+=head1 SYNOPSIS
+
+  use Test::Apache::RewriteRules;
+
+  my $apache = Test::Apache::RewriteRules->new;
+     $apache->add_backend(name => 'ReverseProxyedHost1');
+     $apache->add_backend(name => 'ReverseProxyedHost2');
+     $apache->rewrite_conf('apache.rewrite.conf');
+     $apache->start_apache;
+
+  # testing rewritten result
+  $apache->is_host_path('/foo/aaa', 'ReverseProxyedHost1', '/aaa',
+                        'Handled by reverse-proxyed host 1');
+  $apache->is_host_path('/bar/bbb', 'ReverseProxyedHost2', '/bbb',
+                        'Handled by reverse-proxyed host 2');
+  $apache->is_host_path('/baz', '', '/baz',
+                        'Handled by the proxy itself');
+
+  # testing redirection
+  $apache->is_redirect('/quux/xxx', 'http://external.test/xxx');
+
+  # rewrite rules in `apache.rewrite.conf' passed in above
+  RewriteEngine on
+  RewriteRule /foo/(.*)  http://%{ENV:ReverseProxyedHost1}/$1 [P,L]
+  RewriteRule /bar/(.*)  http://%{ENV:ReverseProxyedHost2}/$1 [P,L]
+  RewriteRule /quux/(.*) http://external.test/$1 [R,L]
+
+=head1 DESCRIPTION
+
+The C<Test::Apache::RewriteRules> module sets up Apache HTTPD server
+for the purpose of testing of a set of C<RewriteRule>s in
+C<apache.conf> Apache configuration.
+
+=head1 METHODS
+
+=head2 available
+
+=over 4
+
+  $is_available = Test::Apache::RewriteRules->available;
+
+Returns whether the features provided by this module is available or
+not. At the time of writing, it returns false is no Apache binary is
+found.
+
+=back
+
+=head2 new (I<[%args]>)
+
+=over 4
+
+  $apache = Test::Apache::RewriteRules->new;
+
+Returns a new instance of the class.
+
+If a ref to hash as a value of C<%args> keyed as 'apache_options'
+passed in, it's passed straight into C<Test::Httpd::Apache2->new()>.
+
+=back
+
+=head2 add_backend (I<%backend>)
+
+=over 4
+
+  $apache->add_backend(name => HOST_NAME);
+
+Registers a backend (i.e. a host that handles HTTP requests). An
+environment variable whose name is C<HOST_NAME> will be defined in the
+automatically-generated Apache configuration file such that it can be
+used in rewrite rules.
+
+=back
+
+=head2 copy_config (I<config_file>, \@patterns)
+
+=over 4
+
+  $apache->copy_config(
+      $config_file, [
+          PATTERN1 => REPLACE1,
+          PATTERN2 => REPLACE2,
+          ...
+      ]
+  )
+
+Copies the file represented by C<$config_file> into the temporary
+directory and optionally replaces its content by applying patterns.
+
+Patterns, if specified, must be an array reference containing string
+or regular expression followed by string or code reference. If the
+replaced string is specified as a code reference, its return value is
+used for the replacement. If the pattern is specified as a regular
+expression and the replaced string is specified as a code reference,
+the code reference can use C<$1>, C<$2>, ... to access to captured
+substrings.
+
+=back
+
+=head2 rewrite_conf (I<$rewrite_conf>)
+
+=over 4
+
+  $apache->rewrite_conf($rewrite_conf)
+
+Sets C<$rewrite_conf> file that represents the path to the
+C<RewriteRule>s' part of the Apache configuration to test.
+
+=back
+
+=head2 start_apache
+
+=over 4
+
+  $apache->start_apache
+
+Boots the Apache process. It should be invoked before any
+C<is_host_path> call.
+
+=back
+
+=head2 is_host_path (I<$request_path>, I<$expected_host_name>, I<$expected_path>, [I<$name>])
+
+=over 4
+
+  $apache->is_host_path($request_path, $expected_host_name, $expected_path, $name);
+
+Checks whether the request for C<$request_path> is handled by host
+C<$expected_host_name> with path C<$expected_path>. The host name
+should be specified by the name registered using C<add_backend>
+method, or the empty string if the request would be handled by the
+reverse proxy (i.e. the rewriting host) itself.
+
+This method acts as a test function of L<Test::Builder> or
+L<Test::More>. The argument C<$name>, if specified, represents the
+name of the test.
+
+=back
+
+=head2 is_redirect (I<$request_path>, I<$expected_redirect_url>, [I<$name>, %args])
+
+=over 4
+
+  $apache->is_redirect($request_path, $expected_redirect_url, $name, code => 301);
+
+Checks whether the request for C<$request_path> is HTTP-redirected to
+the C<$expected_redirect_url>.
+
+This method acts as a test function of L<Test::Builder> or
+L<Test::More>. The argument C<$name>, if specified, represents the
+name of the test.
+
+Optionally, you can specify the expected HTTP status code. The default
+status code is C<302> (Found).
+
+=back
+
+=head2 stop_apache
+
+=over 4
+
+  $apache->stop_apache
+
+Shuts down the Apache process.
+
+=back
+
+=head1 DETAILS
+
+You can set the expected client environment used to evaluate
+C<is_host_path> and C<is_redirect> by using
+L<Test::Apache::RewriteRules::ClientEnvs> module.
+
+Where C<$request_path> is expected, the host of the request (used in
+the C<Host:> request header field) can be specified by prepending
+C<//> followed by host (hostname possibly followed by C<:> and port
+number) before the real path.
+
+=head1 EXAMPLES
+
+See C<t/*.t> and C<t/conf/*.conf>.
+
+=head1 SEE ALSO
+
+=over 4
+
+=item * mod_rewrite <http://httpd.apache.org/docs/2.2/mod/mod_rewrite.html>.
+
+=item * L<Test::More>.
+
+=item * L<Test::Apache::RewriteRules::ClientEnvs>.
+
+=back
+
+=head1 AUTHOR
+
+=over 4
+
+=item * Wakaba (id:wakabatan) <wakabatan@hatena.ne.jp>.
+
+=item * Kentaro Kuribayashi (id:antipop) <antipop@hatena.ne.jp>
+
+=back
+
+=head1 LICENSE
+
+Copyright 2010 Hatena <http://www.hatena.ne.jp/>.
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself.
+
+=cut

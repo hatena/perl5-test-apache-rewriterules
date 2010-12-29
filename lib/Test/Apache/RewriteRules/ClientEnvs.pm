@@ -1,9 +1,8 @@
 package Test::Apache::RewriteRules::ClientEnvs;
 use strict;
 use warnings;
-our $VERSION = '1.0';
-use Exporter::Lite;
 
+use Exporter::Lite;
 our @EXPORT = qw(
     with_request_method
     with_http_cookie
@@ -12,7 +11,7 @@ our @EXPORT = qw(
 
 our $UserAgent;
 our $RequestMethod;
-our $Cookies ||= [];
+our $Cookies    ||= [];
 our $HttpHeader ||= [];
 
 my $user_agent_name;
@@ -82,9 +81,7 @@ for my $b (
     eval sprintf q{
         sub with_%s_browser (&) {
             my ($code) = @_;
-            
             local $UserAgent = q[%s];
-            
             local $Test::Builder::Level = $Test::Builder::Level + 1;
             $code->();
         }
@@ -121,3 +118,70 @@ sub user_agent_name {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+Test::Apache::RewriteRules::ClientEnvs - Set the expected client environment for |Test::Apache::RewriteRules|
+
+=head1 SYNOPSIS
+
+  use Test::Apache::RewriteRules;
+  use Test::Apache::RewriteRules::ClientEnvs;
+
+  $apache = Test::Apache::RewriteRules->new;
+
+  ...
+
+  with_docomo_browser {
+      $apache->is_redirect(q</> => q</mobile/>);
+  };
+
+=head1 DESCRIPTION
+
+The C<Test::Apache::RewriteRules::ClientEnvs> module defines a number
+of blocks that can be used to set expected client environment for
+tests such as C<is_redirect> and C<is_host_path> provided by
+L<Test::Apache::RewriteRules> object.
+
+=head1 BLOCKS
+
+=over 4
+
+=item with_UANAME_browser { CODE };
+
+Sets the C<User-Agent> header field of the expected client environment
+and executes the code.  Available I<UANAME>s include: C<docomo>,
+C<ezweb>, C<softbank>, C<iphone>, C<ipod>, C<ipad>, C<android>,
+C<dsi>, C<wii>, C<firefox>, C<opera>, C<safari>, C<chrome>, C<ie>,
+C<googlebot>, and C<googlebot_mobile>.
+
+=item with_request_method { CODE } REQUEST_METHOD;
+
+Sets the HTTP request method used by the client, such as C<GET> and
+C<POST>, and executes the code.
+
+=item with_http_cookie { CODE } NAME => VALUE;
+
+Appends the name-value pair of cookie that is sent to the server by
+the client.
+
+=back
+
+=head1 SEE ALSO
+
+L<Test::Apache::RewriteRules>.
+
+=head1 AUTHOR
+
+Wakaba (id:wakabatan) <wakabatan@hatena.ne.jp>
+
+=head1 LICENSE
+
+Copyright 2010 Hatena <http://www.hatena.ne.jp/>
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself.
+
+=cut
