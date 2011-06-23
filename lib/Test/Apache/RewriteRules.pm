@@ -15,7 +15,7 @@ use Test::Differences;
 use Test::Httpd::Apache2;
 use Test::TCP qw(empty_port);
 
-our $VERSION = '1.0';
+our $VERSION = '1.0.1';
 
 sub new {
     my ($class, %args) = @_;

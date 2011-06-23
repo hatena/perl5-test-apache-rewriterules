@@ -11,6 +11,10 @@ use Test::Apache::RewriteRules::ClientEnvs;
 
 my $rewrite_conf = file("$FindBin::Bin/conf/rewrite.conf");
 
+if (!Test::Apache::RewriteRules->available) {
+    plan skip_all => "Can't exec httpd";
+}
+
 subtest 'useragent' => sub {
     my $rewrite = Test::Apache::RewriteRules->new;
        $rewrite->add_backend(name => 'BackendFoo');
