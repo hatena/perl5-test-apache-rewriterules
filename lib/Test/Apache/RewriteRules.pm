@@ -315,7 +315,6 @@ sub get_rewrite_result {
     }
 
     my $res = $ua->request($req);
-    die $res->status_line if $res->is_error;
 
     my $code = $res->code;
     my $result;
